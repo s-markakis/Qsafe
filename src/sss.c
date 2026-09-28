@@ -129,7 +129,8 @@ sss_status sss_split_to_files(const unsigned char *secret, size_t secret_len,
             goto done;
         }
         header[24] = (unsigned char)(i + 1);
-        f = fopen(path, "wb");
+        /* A share is unwrapped key material: owner-only from creation. */
+        f = qsafe_fopen_private(path, "wb");
         if (!f) { perror("Error writing share"); ret = SSS_ERR_IO; goto done; }
         if (fwrite(header, 1, sizeof(header), f) != sizeof(header) ||
             fwrite(shares[i], 1, secret_len, f) != secret_len) {
@@ -138,9 +139,8 @@ sss_status sss_split_to_files(const unsigned char *secret, size_t secret_len,
             ret = SSS_ERR_IO;
             goto done;
         }
-        fclose(f); f = NULL;
-        /* A share is unwrapped key material: owner-only, like a secret key. */
-        qsafe_chmod_private(path);
+        if (fclose(f) != 0) { f = NULL; perror("Error writing share"); ret = SSS_ERR_IO; goto done; }
+        f = NULL;
     }
     ret = SSS_OK;
 

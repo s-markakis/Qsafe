@@ -1,9 +1,14 @@
+/* POSIX symbols (umask, mkdir, fseeko via platform.h) under -std=c11. */
+#define _DEFAULT_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <oqs/oqs.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
+#include "platform.h"
 #include "crypto_utils.h"
 #include "vault.h"
 
@@ -849,6 +854,96 @@ static void test_vault_directory(void) {
     }
 }
 
+/* A malicious encryptor controls the stored name and mode. Hand-build a valid
+ * QSAFE007 container (real recipient wrap, real frame AEAD) whose metadata
+ * names `..\..\evil.txt` with mode 0666, decrypt it into a directory, and check
+ * the output stays inside that directory under its final component and that
+ * the mode is filtered through the umask. */
+static void test_hostile_stored_name(void) {
+    printf("\n[test_hostile_stored_name]\n");
+    OQS_KEM *kem = OQS_KEM_new(OQS_KEM_alg_ml_kem_1024);
+    if (!kem) { ASSERT(0, "initialize ML-KEM-1024 KEM"); return; }
+    unsigned char *pub = NULL, *sec = NULL;
+    size_t pl = 0, sl = 0;
+    if (crypto_generate_identity(kem, &pub, &pl, &sec, &sl) != CRYPTO_SUCCESS) {
+        ASSERT(0, "generate identity"); OQS_KEM_free(kem); return;
+    }
+
+    const char *name = "..\\..\\evil.txt";
+    const char *body = "hostile payload";
+    size_t body_len = strlen(body);
+    size_t rec_len = X25519_KEY_SIZE + kem->length_ciphertext + AES_GCM_NONCE_SIZE +
+                     QSAFE_CEK_SIZE + AES_GCM_TAG_SIZE;
+    size_t hdr_len = VERSION_HEADER_SIZE + 1 + rec_len;
+    size_t pt_len = QSAFE_META_SIZE_V7 + body_len;
+    unsigned char *hdr = malloc(hdr_len), *pt = calloc(1, pt_len), *ct = malloc(pt_len);
+    unsigned char cek[QSAFE_CEK_SIZE], nonce[AES_GCM_NONCE_SIZE], tag[AES_GCM_TAG_SIZE];
+    int built = hdr && pt && ct && RAND_bytes(cek, sizeof(cek)) == 1;
+    if (built) {
+        memcpy(hdr, VERSION_HEADER_V7, VERSION_HEADER_SIZE);
+        hdr[VERSION_HEADER_SIZE] = 1;
+        /* "qsafe-v5-hybrid-kek" is the container's recipient-wrap label (FORMAT.md). */
+        built = crypto_hybrid_wrap(kem, pub, "qsafe-v5-hybrid-kek", cek, QSAFE_CEK_SIZE,
+                                   hdr + VERSION_HEADER_SIZE + 1) == CRYPTO_SUCCESS;
+    }
+    if (built) {
+        unsigned char le[8];
+        pt[0] = QSAFE_META_FLAG_PRESENT;
+        pt[2] = (unsigned char)strlen(name);
+        memcpy(pt + 4, name, strlen(name));
+        u64le(0666, le);                       /* mode (u32 LE: low 4 bytes) */
+        memcpy(pt + 4 + QSAFE_META_NAME_FIELD, le, 4);
+        u64le((uint64_t)body_len, le);         /* content_len; pad_len stays 0 */
+        memcpy(pt + QSAFE_META_SIZE, le, 8);
+        memcpy(pt + QSAFE_META_SIZE_V7, body, body_len);
+        crypto_frame_nonce(0, 1, nonce);       /* single, final frame */
+        built = crypto_gcm_seal_aad(cek, nonce, hdr, hdr_len, pt, (int)pt_len, ct, tag) == 1;
+    }
+    const char *enc = "test_hostile_name.qsafe";
+    const char *dir = "test_hostile_out";
+    if (built) {
+        FILE *f = fopen(enc, "wb");
+        built = f && fwrite(hdr, 1, hdr_len, f) == hdr_len &&
+                fwrite(ct, 1, pt_len, f) == pt_len &&
+                fwrite(tag, 1, sizeof(tag), f) == sizeof(tag);
+        if (f) fclose(f);
+    }
+    ASSERT(built, "hand-built hostile-name container");
+
+    remove("test_hostile_out/evil.txt");
+    remove(dir);
+    ASSERT(qsafe_mkdir(dir) == 0, "create output directory");
+#ifndef _WIN32
+    mode_t old_mask = umask(022);
+#endif
+    crypto_config_t config = { .force_overwrite = 1, .secret_key_file = DEFAULT_SECRET_KEY_FILE };
+    ASSERT(crypto_decrypt_file(enc, dir, kem, sec, &config) == CRYPTO_SUCCESS,
+           "hostile-name container decrypts into a directory");
+    unsigned char *got = NULL;
+    size_t got_len = 0;
+    ASSERT(read_file("test_hostile_out/evil.txt", &got, &got_len) &&
+           got_len == body_len && memcmp(got, body, body_len) == 0,
+           "stored name is reduced to its final component inside the directory");
+    free(got);
+    struct stat st;
+    ASSERT(stat("test_hostile_out/..\\..\\evil.txt", &st) != 0,
+           "no file named with the raw backslash path is created");
+#ifndef _WIN32
+    ASSERT(stat("test_hostile_out/evil.txt", &st) == 0 && (st.st_mode & 0777) == 0644,
+           "sender's mode 0666 is filtered through umask 022 to 0644");
+    umask(old_mask);
+#endif
+
+    remove("test_hostile_out/evil.txt");
+    remove(dir);
+    remove(enc);
+    OPENSSL_cleanse(cek, sizeof(cek));
+    free(hdr); free(pt); free(ct);
+    OPENSSL_cleanse(sec, sl);
+    free(sec); free(pub);
+    OQS_KEM_free(kem);
+}
+
 int main(void) {
     printf("=== Qsafe 5.0 Unit Tests ===\n");
 
@@ -862,6 +957,7 @@ int main(void) {
     test_vault_known_answer_vectors();
     test_vault_v2_known_answer_vectors();
     test_vault_directory();
+    test_hostile_stored_name();
     test_error_codes();
 
     printf("\n=== Results: %d/%d passed ===\n", tests_passed, tests_run);

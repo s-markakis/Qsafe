@@ -197,6 +197,25 @@ static crypto_error_t resolve_passphrase(crypto_config_t *config, const char *cl
         }
         const char *account = config->secret_key_file;
         if (confirm) {
+            /* The stored passphrase is random and exists nowhere else, and
+             * keychain_store replaces an existing item — so creating a key
+             * under an account that already has one (a second keygen, an
+             * aborted overwrite, `vault create` under the default key path)
+             * would permanently lock out the key that item protects. */
+            if (!config->force_overwrite) {
+                kc_status existing = keychain_retrieve(KEYCHAIN_SERVICE, account, buf, bufsz);
+                OPENSSL_cleanse(buf, bufsz);
+                if (existing == KC_OK) {
+                    fprintf(stderr, "Error: a keychain passphrase already exists for '%s'; replacing it would\n"
+                                    "make the key it protects unrecoverable. Use --force to replace it.\n", account);
+                    return CRYPTO_ERR_INVALID_INPUT;
+                }
+                if (existing != KC_ERR_NOTFOUND) { /* e.g. access denied: can't prove it's absent */
+                    fprintf(stderr, "Error: could not check the keychain for an existing entry for '%s'\n"
+                                    "(use --force to replace any entry)\n", account);
+                    return CRYPTO_ERR_FILE_IO;
+                }
+            }
             unsigned char rnd[24];
             if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
                 fprintf(stderr, "Error: could not generate a keychain passphrase\n");
@@ -412,7 +431,8 @@ static int run_age_command(const char *command, const char *const *positionals, 
             return 1;
         }
         const char *out = npos >= 1 ? positionals[0] : NULL;
-        FILE *f = out ? fopen(out, "w") : stdout;
+        /* An unencrypted secret key: owner-only from the moment it exists. */
+        FILE *f = out ? qsafe_fopen_private(out, "w") : stdout;
         if (!f) {
             fprintf(stderr, "Error: cannot write '%s'\n", out);
             OPENSSL_cleanse(sec, sizeof(sec));
@@ -420,8 +440,11 @@ static int run_age_command(const char *command, const char *const *positionals, 
         }
         fprintf(f, "# public key: %s\n%s\n", pub, sec);
         if (out) {
-            fclose(f);
-            qsafe_chmod_private(out);
+            if (fclose(f) != 0) {
+                fprintf(stderr, "Error: cannot write '%s'\n", out);
+                OPENSSL_cleanse(sec, sizeof(sec));
+                return 1;
+            }
             fprintf(stderr, "Public key: %s\n", pub);
         }
         OPENSSL_cleanse(sec, sizeof(sec));
@@ -1446,6 +1469,8 @@ int main(int argc, char *argv[]) {
         secret_blob = crypto_load_secret_key(config.secret_key_file, &secret_len, &config);
         if (secret_blob == NULL || secret_len != X25519_KEY_SIZE + kem->length_secret_key) {
             fprintf(stderr, "Error: Failed to load secret key or invalid key length\n");
+            /* e.g. a signing key: still decrypted secret material, so wipe it. */
+            if (secret_blob) OPENSSL_cleanse(secret_blob, secret_len);
             free(secret_blob);
             secret_blob = NULL;
             ret = CRYPTO_ERR_FILE_IO;
@@ -1473,8 +1498,15 @@ int main(int argc, char *argv[]) {
         } else if (is_encrypt) {
             crypto_config_t tcfg = config;
             tcfg.force_overwrite = 1; /* the temp file is ours to overwrite */
-            ret = crypto_encrypt_file(input_path, tmp, kem, recipient_ptrs, n_recip_loaded, &tcfg);
-            if (ret == CRYPTO_SUCCESS) ret = crypto_armor(tmp, output_path);
+            /* The temp file is forced, so ask about the real output here —
+             * crypto_armor itself writes unconditionally. */
+            if (!crypto_confirm_overwrite(output_path, &config)) {
+                fprintf(stderr, "Skipped %s\n", output_path);
+                ret = CRYPTO_SUCCESS;
+            } else {
+                ret = crypto_encrypt_file(input_path, tmp, kem, recipient_ptrs, n_recip_loaded, &tcfg);
+                if (ret == CRYPTO_SUCCESS) ret = crypto_armor(tmp, output_path);
+            }
             remove(tmp);
         } else {
             ret = crypto_dearmor(input_path, tmp);
