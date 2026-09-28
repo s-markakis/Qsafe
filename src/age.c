@@ -116,9 +116,10 @@ static uint32_t bech_polymod(const uint8_t *v, size_t n) {
     return chk;
 }
 
-/* Convert 8-bit groups to 5-bit (pad=1) or 5-bit to 8-bit (pad=0). */
+/* Convert 8-bit groups to 5-bit (pad=1) or 5-bit to 8-bit (pad=0). Writes at
+ * most outcap bytes; returns -1 if the output would not fit. */
 static int convbits(const uint8_t *in, size_t n, int from, int to, int pad,
-                    uint8_t *out, size_t *outlen) {
+                    uint8_t *out, size_t outcap, size_t *outlen) {
     uint32_t acc = 0;
     int bits = 0;
     size_t o = 0;
@@ -128,11 +129,15 @@ static int convbits(const uint8_t *in, size_t n, int from, int to, int pad,
         bits += from;
         while (bits >= to) {
             bits -= to;
+            if (o >= outcap) return -1;
             out[o++] = (uint8_t)((acc >> bits) & maxv);
         }
     }
     if (pad) {
-        if (bits) out[o++] = (uint8_t)((acc << (to - bits)) & maxv);
+        if (bits) {
+            if (o >= outcap) return -1;
+            out[o++] = (uint8_t)((acc << (to - bits)) & maxv);
+        }
     } else if (bits >= from || ((acc << (to - bits)) & maxv)) {
         return -1;  /* invalid padding */
     }
@@ -145,7 +150,7 @@ static int bech32_encode(const char *hrp, const uint8_t *data, size_t dlen,
                          char *out, size_t outsz) {
     uint8_t five[256];
     size_t flen = 0;
-    if (convbits(data, dlen, 8, 5, 1, five, &flen) != 0) return -1;
+    if (convbits(data, dlen, 8, 5, 1, five, sizeof(five), &flen) != 0) return -1;
     size_t hlen = strlen(hrp);
     uint8_t values[512];
     size_t vi = 0;
@@ -167,10 +172,11 @@ static int bech32_encode(const char *hrp, const uint8_t *data, size_t dlen,
     return (int)o;
 }
 
-/* Decode a Bech32 string into raw bytes; verifies HRP matches want_hrp
- * (case-insensitively). Returns 0 on success. */
+/* Decode a Bech32 string into raw bytes (at most outcap); verifies the HRP
+ * matches want_hrp (case-insensitively) and the checksum. Returns 0 on
+ * success. */
 static int bech32_decode(const char *str, const char *want_hrp,
-                         uint8_t *out, size_t *outlen) {
+                         uint8_t *out, size_t outcap, size_t *outlen) {
     char low[512];
     size_t n = strlen(str);
     if (n >= sizeof(low)) return -1;
@@ -194,15 +200,23 @@ static int bech32_decode(const char *str, const char *want_hrp,
     const char *dp = sep + 1;
     size_t dlen = strlen(dp);
     if (dlen < 6) return -1;
-    uint8_t five[512];
+    /* hrp-expand(hrp) ‖ data: the checksum input (hlen < 64, dlen < 512). */
+    uint8_t values[2 * 64 + 1 + 512];
+    size_t vi = 0;
+    for (size_t i = 0; i < hlen; i++) values[vi++] = (uint8_t)((unsigned char)low[i] >> 5);
+    values[vi++] = 0;
+    for (size_t i = 0; i < hlen; i++) values[vi++] = (uint8_t)(low[i] & 31);
+    const uint8_t *five = values + vi;
     for (size_t i = 0; i < dlen; i++) {
         int v = bech_val(dp[i]);
         if (v < 0) return -1;
-        five[i] = (uint8_t)v;
+        values[vi++] = (uint8_t)v;
     }
-    /* (checksum verification omitted: we re-derive keys and the AEAD/MAC catch
-     * any corruption; data bytes are the 5-bit groups minus the 6 checksum.) */
-    return convbits(five, dlen - 6, 5, 8, 0, out, outlen);
+    /* The checksum matters on the encrypt side: a mistyped recipient would
+     * otherwise decode to a valid-looking key nobody holds, and the file would
+     * be unrecoverable. */
+    if (bech_polymod(values, vi) != 1) return -1;
+    return convbits(five, dlen - 6, 5, 8, 0, out, outcap, outlen);
 }
 
 /* --------------------------- primitives --------------------------------- */
@@ -351,7 +365,7 @@ static age_status make_stanza(const uint8_t file_key[FILE_KEY_LEN],
                               const char *recipient, char **out) {
     uint8_t rpk[64];
     size_t rpl = 0;
-    if (bech32_decode(recipient, "age", rpk, &rpl) != 0 || rpl != 32) return AGE_ERR_INPUT;
+    if (bech32_decode(recipient, "age", rpk, sizeof(rpk), &rpl) != 0 || rpl != 32) return AGE_ERR_INPUT;
     uint8_t esk[32], epk[32], shared[32], wrap[32];
     if (!x25519_keypair(esk, epk) || !x25519_shared(esk, rpk, shared)) {
         OPENSSL_cleanse(esk, 32);
@@ -502,7 +516,7 @@ age_status age_decrypt_file(const char *in_path, const char *out_path,
                             const char *identity) {
     uint8_t sk[64];
     size_t skl = 0;
-    if (bech32_decode(identity, "AGE-SECRET-KEY-", sk, &skl) != 0 || skl != 32)
+    if (bech32_decode(identity, "AGE-SECRET-KEY-", sk, sizeof(sk), &skl) != 0 || skl != 32)
         return AGE_ERR_INPUT;
 
     uint8_t *data = NULL;

@@ -13,6 +13,7 @@
 
 #ifdef _WIN32
   #include <windows.h>
+  #include <string.h>   /* _stricmp */
   #include <io.h>
   #include <fcntl.h>
   #include <direct.h>
@@ -22,6 +23,7 @@
   #endif
 #else
   #include <limits.h>
+  #include <fcntl.h>
   #include <unistd.h>
   #include <utime.h>
 #endif
@@ -65,8 +67,33 @@ static inline void qsafe_chmod_private(const char *path) {
 #endif
 }
 
+/* Opens `path` for writing ("w"/"wb"), owner-only (0600) from the moment it
+ * exists, so secret material is never readable by others — not even in the
+ * window between fopen() creating it under the umask and a later chmod. An
+ * existing file is truncated and tightened to 0600 before anything is written;
+ * if it cannot be tightened (e.g. owned by someone else) nothing is written. */
+static inline FILE *qsafe_fopen_private(const char *path, const char *mode) {
+#ifdef _WIN32
+    FILE *f = fopen(path, mode);
+    if (f) _chmod(path, _S_IREAD | _S_IWRITE);
+    return f;
+#else
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return NULL;
+    if (fchmod(fd, 0600) != 0) { close(fd); return NULL; }
+    FILE *f = fdopen(fd, mode);
+    if (!f) close(fd);
+    return f;
+#endif
+}
+
 /* Best-effort restore of a decrypted file's permission bits and mtime. On
- * Windows only the mtime is applied (no POSIX mode bits). */
+ * Windows only the mtime is applied (no POSIX mode bits). The stored mode was
+ * chosen by whoever encrypted the file, so — like tar for non-root users — it
+ * is filtered through the process umask: a sender cannot make the plaintext
+ * world-writable, or group/world-readable under a private umask such as 077.
+ * (umask can only be read by setting it; the brief window only matters to a
+ * multithreaded embedder creating files at the same instant.) */
 static inline void qsafe_restore_meta(const char *path, unsigned mode, unsigned long long mtime) {
 #ifdef _WIN32
     (void)mode;
@@ -75,7 +102,9 @@ static inline void qsafe_restore_meta(const char *path, unsigned mode, unsigned 
     t.modtime = (time_t)mtime;
     _utime(path, &t);
 #else
-    chmod(path, (mode_t)(mode & 0777));
+    mode_t mask = umask(0);
+    umask(mask);
+    chmod(path, (mode_t)(mode & 0777 & ~mask));
     struct utimbuf t;
     t.actime = (time_t)mtime;
     t.modtime = (time_t)mtime;
@@ -108,6 +137,30 @@ static inline int qsafe_realpath(const char *path, char *resolved) {
     return _fullpath(resolved, path, PATH_MAX) != NULL;
 #else
     return realpath(path, resolved) != NULL;
+#endif
+}
+
+/* fstat() of an open stream (MinGW spells fileno `_fileno`, as above). */
+static inline int qsafe_fstat_stream(FILE *f, struct stat *st) {
+#ifdef _WIN32
+    return fstat(_fileno(f), st);
+#else
+    return fstat(fileno(f), st);
+#endif
+}
+
+/* Returns 1 if both paths exist and name the same file (so writing one would
+ * truncate the other mid-read), 0 otherwise. Windows has no stable inode in
+ * struct stat, so compare canonical paths case-insensitively there. */
+static inline int qsafe_same_file(const char *a, const char *b) {
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return 0;
+#ifdef _WIN32
+    char ra[PATH_MAX], rb[PATH_MAX];
+    if (!_fullpath(ra, a, PATH_MAX) || !_fullpath(rb, b, PATH_MAX)) return 0;
+    return _stricmp(ra, rb) == 0;
+#else
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
 #endif
 }
 

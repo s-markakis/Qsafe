@@ -183,6 +183,10 @@ crypto_error_t crypto_fingerprint(const unsigned char *data, size_t len, char *o
 crypto_error_t crypto_armor(const char *in_path, const char *out_path);
 crypto_error_t crypto_dearmor(const char *in_path, const char *out_path);
 
+/* Returns 1 if `path` may be written: it is "-", does not exist, --force is
+ * set, or the user confirms the overwrite prompt. Returns 0 if declined. */
+int crypto_confirm_overwrite(const char *path, const crypto_config_t *config);
+
 /* Prints, on stdout, what can be learned about a file without the secret key:
  * key files report their type + fingerprint; QSAFE files report version and the
  * encrypted payload size. Never decrypts. */

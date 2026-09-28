@@ -377,7 +377,7 @@ crypto_error_t vault_init(const char *path, uint64_t size, int force) {
             return CRYPTO_ERR_INVALID_INPUT;
         }
     }
-    FILE *out = fopen(path, "wb");
+    FILE *out = qsafe_fopen_private(path, "wb");
     if (!out) { perror("Error creating container"); return CRYPTO_ERR_FILE_IO; }
 
     unsigned char buf[65536];
@@ -482,6 +482,35 @@ crypto_error_t vault_write(const char *path, uint64_t offset, uint64_t capacity,
         goto cleanup;
     }
 
+    /* A v1 slot key and its frame nonces are a pure function of (passphrase,
+     * offset, capacity), so re-sealing an occupied slot reuses every AES-GCM
+     * (key, nonce) pair: anyone holding the old and the new container bytes
+     * learns old XOR new plaintext, and GCM's authentication key with it. If
+     * frame 0 already opens under this key, refuse unless --force. (v2 volumes
+     * — `vault add` etc. — draw a fresh nonce salt per write and are immune.) */
+    if (!config->force_overwrite) {
+        size_t want0 = (nframes > 1) ? (size_t)QSAFE_FRAME_SIZE : (size_t)rem;
+        unsigned char tag0[AES_GCM_TAG_SIZE], nonce0[AES_GCM_NONCE_SIZE];
+        crypto_frame_nonce(0, nframes == 1, nonce0);
+        int occupied = (want0 == 0 || fread(frame_ct, 1, want0, out) == want0) &&
+                       fread(tag0, 1, AES_GCM_TAG_SIZE, out) == AES_GCM_TAG_SIZE &&
+                       crypto_gcm_open_aad(slot_key, nonce0, aad, sizeof(aad),
+                                           frame_ct, (int)want0, tag0, frame_pt);
+        OPENSSL_cleanse(frame_pt, QSAFE_FRAME_SIZE);
+        if (occupied) {
+            fprintf(stderr, "Error: this slot already holds data under this passphrase. Rewriting a v1\n"
+                            "slot reuses its AES-GCM nonces: anyone with a copy of the old container\n"
+                            "could recover both contents. Prefer the v2 volume commands (vault add/rm),\n"
+                            "or pass --force if no copy of the old container can exist.\n");
+            ret = CRYPTO_ERR_INVALID_INPUT;
+            goto cleanup;
+        }
+        if (qsafe_fseek64(out, (long long)offset, SEEK_SET) != 0) {
+            ret = CRYPTO_ERR_FILE_IO;
+            goto cleanup;
+        }
+    }
+
     for (uint64_t ctr = 0; ctr < nframes; ctr++) {
         int last = (ctr == nframes - 1);
         size_t want = last ? (size_t)rem : (size_t)QSAFE_FRAME_SIZE;
@@ -529,7 +558,7 @@ crypto_error_t vault_write(const char *path, uint64_t offset, uint64_t capacity,
 
 cleanup:
     OPENSSL_cleanse(slot_key, sizeof(slot_key));
-    free(frame_pt);
+    if (frame_pt) { OPENSSL_cleanse(frame_pt, QSAFE_FRAME_SIZE); free(frame_pt); }
     free(frame_ct);
     fclose(out);
     fclose(in);
@@ -778,7 +807,12 @@ done:
 static crypto_error_t vault_atomic_write(const char *path, const unsigned char *data, uint64_t size) {
     char tmp[PATH_MAX];
     if ((size_t)snprintf(tmp, sizeof(tmp), "%s.qsftmp", path) >= sizeof(tmp)) return CRYPTO_ERR_INVALID_INPUT;
-    FILE *f = fopen(tmp, "wb");
+    /* A container (e.g. the secrets store) is an offline passphrase-guessing
+     * target, so a new one is owner-only; a rewrite keeps whatever mode the
+     * existing container has, so the user's own chmod survives. */
+    struct stat old_st;
+    int had_old = (stat(path, &old_st) == 0);
+    FILE *f = qsafe_fopen_private(tmp, "wb");
     if (!f) { perror("Error creating temp container"); return CRYPTO_ERR_FILE_IO; }
     uint64_t off = 0;
     while (off < size) {
@@ -788,6 +822,11 @@ static crypto_error_t vault_atomic_write(const char *path, const unsigned char *
         off += chunk;
     }
     if (fclose(f) != 0) { remove(tmp); return CRYPTO_ERR_FILE_IO; }
+#ifndef _WIN32
+    if (had_old) chmod(tmp, old_st.st_mode & 07777);
+#else
+    (void)had_old;
+#endif
     if (rename(tmp, path) != 0) {
         if (remove(path) != 0 || rename(tmp, path) != 0) { remove(tmp); return CRYPTO_ERR_FILE_IO; }
     }

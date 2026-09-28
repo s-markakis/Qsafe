@@ -157,8 +157,9 @@ verifies it automatically and reports the signer's fingerprint; verification
 failure removes any output.
 .TP
 .BI \-\-signer " pk"
-For decrypt/verify: additionally require the embedded signer to be exactly
-this public key.
+For decrypt/verify: require a valid embedded signature whose signer is exactly
+this public key. Unsigned files (including all QSAFE006/005 files) are
+rejected.
 .TP
 .B \-\-pad
 For encrypt: append random padding to the file's Padm\('e bucket, so the

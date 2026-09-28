@@ -105,11 +105,17 @@ crypto_error_t crypto_fingerprint(const unsigned char *data, size_t len, char *o
 }
 
 /* Returns a pointer to the final path component (defends against a stored name
- * that contains directory separators). */
+ * that contains directory separators). Backslash is a separator on every
+ * platform: a name is chosen by whoever encrypted the file, and `..\..\x`
+ * decrypted into a directory on Windows would otherwise escape it. On Windows
+ * a drive/stream colon (`C:x`, `f:ads`) is stripped too. */
 static const char *path_basename(const char *path) {
     const char *base = path;
     for (const char *c = path; *c; c++) {
-        if (*c == '/') base = c + 1;
+        if (*c == '/' || *c == '\\') base = c + 1;
+#ifdef _WIN32
+        if (*c == ':') base = c + 1;
+#endif
     }
     return base;
 }
@@ -276,6 +282,10 @@ static int crypto_should_write(const char *path, const crypto_config_t *config) 
     return answer;
 }
 
+int crypto_confirm_overwrite(const char *path, const crypto_config_t *config) {
+    return crypto_should_write(path, config);
+}
+
 crypto_error_t crypto_save_secret_key(const char *filename, const unsigned char *secret_key, size_t length, const crypto_config_t *config) {
     if (!config->passphrase) {
         fprintf(stderr, "Error: Passphrase required for secret key encryption\n");
@@ -341,7 +351,8 @@ crypto_error_t crypto_save_secret_key(const char *filename, const unsigned char 
         goto cleanup;
     }
 
-    file = fopen(filename, "wb");
+    /* Secret key material: owner-only from creation, not chmod'ed afterwards. */
+    file = qsafe_fopen_private(filename, "wb");
     if (!file) {
         perror("Error opening key file");
         ret = CRYPTO_ERR_FILE_IO;
@@ -358,9 +369,11 @@ crypto_error_t crypto_save_secret_key(const char *filename, const unsigned char 
         goto cleanup;
     }
 
-    /* Secret key material: restrict permissions to the owner. */
-    fflush(file);
-    qsafe_chmod_private(filename);
+    if (fflush(file) != 0) {
+        perror("Error writing key file");
+        ret = CRYPTO_ERR_FILE_IO;
+        goto cleanup;
+    }
 
     ret = CRYPTO_SUCCESS;
 
@@ -1092,9 +1105,11 @@ crypto_error_t crypto_encrypt_file(const char *input_filename, const char *outpu
         goto cleanup;
     }
 
-    /* Build the v7 metadata block. For real files we capture the original name,
-     * permission bits, mtime, and content length; for stdin the length is
-     * unknown (and padding, which needs it, is unavailable). */
+    /* Build the v7 metadata block. For regular files we capture the original
+     * name, permission bits, mtime, and content length; for stdin and other
+     * non-regular inputs (FIFOs, `<(cmd)`, /dev/stdin, devices) st_size is not
+     * the content length, so they are streamed like stdin — trusting a FIFO's
+     * st_size of 0 would silently encrypt an empty file. */
     memset(meta, 0, sizeof(meta));
     size_t file_size = 0;
     int have_size = 0;
@@ -1102,7 +1117,7 @@ crypto_error_t crypto_encrypt_file(const char *input_filename, const char *outpu
     uint64_t pad_len = 0;
     if (!from_stdin) {
         struct stat st;
-        if (stat(input_filename, &st) == 0) {
+        if (qsafe_fstat_stream(in_file, &st) == 0 && S_ISREG(st.st_mode)) {
             file_size = (size_t)st.st_size;
             have_size = 1;
             content_len = (uint64_t)st.st_size;
@@ -1166,6 +1181,15 @@ crypto_error_t crypto_encrypt_file(const char *input_filename, const char *outpu
             ret = wr;
             goto cleanup;
         }
+    }
+
+    /* Writing the output would truncate the input we are about to read — and
+     * the failure cleanup would then delete it. */
+    if (!from_stdin && !is_stream_arg(output_filename) &&
+        qsafe_same_file(input_filename, output_filename)) {
+        fprintf(stderr, "Error: input and output are the same file ('%s')\n", output_filename);
+        ret = CRYPTO_ERR_INVALID_INPUT;
+        goto cleanup;
     }
 
     if (!crypto_should_write(output_filename, config)) {
@@ -1398,6 +1422,7 @@ typedef struct {
     size_t buf_cap;
 
     const char *output_arg;
+    const char *input_arg;     /* to refuse writing over the ciphertext being read */
     const crypto_config_t *config;
 } dec_sink_t;
 
@@ -1435,6 +1460,12 @@ static crypto_error_t dec_sink_open(dec_sink_t *s) {
             fprintf(stderr, "Error: output path too long\n");
             return CRYPTO_ERR_INVALID_INPUT;
         }
+    }
+
+    if (s->input_arg && !is_stream_arg(s->input_arg) &&
+        qsafe_same_file(s->input_arg, s->out_path)) {
+        fprintf(stderr, "Error: input and output are the same file ('%s')\n", s->out_path);
+        return CRYPTO_ERR_INVALID_INPUT;
     }
 
     if (!crypto_should_write(s->out_path, s->config)) {
@@ -1522,7 +1553,7 @@ static crypto_error_t dec_sink_write(dec_sink_t *s, const unsigned char *p, size
             /* Reject path components in the stored name (traversal defense). */
             const char *base = path_basename(s->name);
             if (base != s->name) memmove(s->name, base, strlen(base) + 1);
-            if (strcmp(s->name, "..") == 0) s->name[0] = '\0';
+            if (strcmp(s->name, "..") == 0 || strcmp(s->name, ".") == 0) s->name[0] = '\0';
             s->mode = load_u32(s->meta + 4 + QSAFE_META_NAME_FIELD);
             s->mtime = load_u64(s->meta + 4 + QSAFE_META_NAME_FIELD + 4);
         }
@@ -1551,6 +1582,15 @@ static crypto_error_t dec_sink_write(dec_sink_t *s, const unsigned char *p, size
             }
         }
         s->meta_done = 1;
+
+        /* --signer demands an embedded signature. Refuse unsigned v7 files and
+         * v5/v6 files (which cannot carry one) here, before an output is opened
+         * or any content released — otherwise anyone holding the recipient's
+         * public key could bypass the pin simply by not signing. */
+        if (s->config->signer_pk_file && !(s->is_v7 && s->signed_mode)) {
+            fprintf(stderr, "Error: --signer requires a signed file, but this file carries no embedded signature\n");
+            return CRYPTO_ERR_INTEGRITY;
+        }
 
         crypto_error_t orc = dec_sink_open(s);
         if (orc != CRYPTO_SUCCESS) return orc;
@@ -1627,6 +1667,12 @@ static crypto_error_t dec_sink_write(dec_sink_t *s, const unsigned char *p, size
 /* Called once every frame has authenticated: enforce the declared layout and
  * verify the embedded sender signature, if any. */
 static crypto_error_t dec_sink_finish(dec_sink_t *s, const crypto_config_t *config) {
+    /* Defense in depth: dec_sink_write already refused unsigned input under
+     * --signer; never let such a file reach a success return. */
+    if (config->signer_pk_file && !(s->is_v7 && s->signed_mode)) {
+        fprintf(stderr, "Error: --signer requires a signed file, but this file carries no embedded signature\n");
+        return CRYPTO_ERR_INTEGRITY;
+    }
     if (!s->is_v7) return CRYPTO_SUCCESS;
 
     if (s->content_len != QSAFE_LEN_UNKNOWN) {
@@ -1731,6 +1777,7 @@ crypto_error_t crypto_decrypt_file(const char *input_filename, const char *outpu
     dec_sink_t sink;
     memset(&sink, 0, sizeof(sink));
     sink.output_arg = output_filename;
+    sink.input_arg = input_filename;
     sink.config = config;
     sink.verify_only = config->check_only;
     sink.content_len = QSAFE_LEN_UNKNOWN;
@@ -2023,6 +2070,17 @@ crypto_error_t crypto_process_directory(const char *dir_path, const char *output
             continue;
         }
 
+#ifndef _WIN32
+        /* Never follow symlinks: a `loop -> ..` link recursed until the path
+         * limit (re-encrypting the parent tree, including our own output), and
+         * a link to a file outside the tree (say ~/.ssh/id_ed25519) would be
+         * encrypted to the recipients. */
+        struct stat lst;
+        if (lstat(input_file_path, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+            fprintf(stderr, "Warning: skipping symlink %s\n", input_file_path);
+            continue;
+        }
+#endif
         if (stat(input_file_path, &st) != 0) {
             continue;
         }

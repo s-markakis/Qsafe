@@ -391,15 +391,18 @@ static int cmd_keygen(const char *out_path) {
         if (*c >= 'a' && *c <= 'z') *c = (char)(*c - 'a' + 'A');
     }
 
-    FILE *f = out_path ? fopen(out_path, "w") : stdout;
+    /* An unencrypted identity: owner-only from the moment it exists. */
+    FILE *f = out_path ? qsafe_fopen_private(out_path, "w") : stdout;
     if (!f) {
         fprintf(stderr, "Error: cannot write '%s'\n", out_path);
         goto done;
     }
     fprintf(f, "# public key: %s\n%s\n", recip, ident);
     if (out_path) {
-        fclose(f);
-        qsafe_chmod_private(out_path);
+        if (fclose(f) != 0) {
+            fprintf(stderr, "Error: cannot write '%s'\n", out_path);
+            goto done;
+        }
         fprintf(stderr, "Public key: %s\n", recip);
     }
     rc = 0;

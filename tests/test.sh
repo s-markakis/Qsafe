@@ -333,6 +333,70 @@ if cmp -s "$TMPDIR/armor.txt" "$TMPDIR/armor.out"; then pass "armor round-trip m
 "$BINARY" encrypt --armor --key-file "$KEYFILE" - < "$TMPDIR/armor.txt" 2>/dev/null \
     | "$BINARY" decrypt --armor --key-file "$KEYFILE" - 2>/dev/null > "$TMPDIR/armor.pipe.out"
 if cmp -s "$TMPDIR/armor.txt" "$TMPDIR/armor.pipe.out"; then pass "armored pipe round-trip"; else fail "armored pipe round-trip"; fi
+# --armor encrypt must honor the overwrite prompt like the binary path does.
+echo "do not clobber" > "$TMPDIR/armor_existing.asc"
+echo n | "$BINARY" encrypt --armor --key-file "$KEYFILE" "$TMPDIR/armor.txt" "$TMPDIR/armor_existing.asc" >/dev/null 2>&1
+grep -q "do not clobber" "$TMPDIR/armor_existing.asc" \
+    && pass "--armor encrypt does not overwrite without confirmation" \
+    || fail "--armor encrypt does not overwrite without confirmation"
+
+# --- Test 15a: directory mode does not follow symlinks ---
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) ;;
+  *)
+    echo ""
+    echo "[test: directory symlinks]"
+    mkdir -p "$TMPDIR/symdir"
+    echo "inside" > "$TMPDIR/symdir/real.txt"
+    echo "outside the tree" > "$TMPDIR/sym_outside.txt"
+    ln -s ../sym_outside.txt "$TMPDIR/symdir/link.txt"
+    ln -s .. "$TMPDIR/symdir/loop"
+    check_ok "directory encrypt with a symlink loop terminates" \
+        "$BINARY" --force --key-file "$KEYFILE" encrypt "$TMPDIR/symdir" "$TMPDIR/symdir_q"
+    [ -f "$TMPDIR/symdir_q/real.txt" ] && pass "regular files are still encrypted" \
+        || fail "regular files are still encrypted"
+    [ ! -e "$TMPDIR/symdir_q/link.txt" ] && [ ! -e "$TMPDIR/symdir_q/loop" ] \
+        && pass "symlinks are skipped, not followed" || fail "symlinks are skipped, not followed"
+    ;;
+esac
+
+# --- Test 15b: data-loss guards ---
+echo ""
+echo "[test: data-loss guards]"
+# Encrypting (or decrypting) a file onto itself would truncate the input
+# mid-read and then delete it on the resulting failure.
+echo "in-place victim" > "$TMPDIR/inplace.txt"
+check_fail "encrypt refuses input == output" \
+    "$BINARY" --force --key-file "$KEYFILE" encrypt "$TMPDIR/inplace.txt" "$TMPDIR/inplace.txt"
+grep -q "in-place victim" "$TMPDIR/inplace.txt" 2>/dev/null \
+    && pass "input survives an input == output encrypt" \
+    || fail "input survives an input == output encrypt"
+"$BINARY" --force --key-file "$KEYFILE" encrypt "$TMPDIR/inplace.txt" "$TMPDIR/inplace.q" >/dev/null 2>&1
+cp "$TMPDIR/inplace.q" "$TMPDIR/inplace.q.orig"
+check_fail "decrypt refuses input == output" \
+    "$BINARY" --force --key-file "$KEYFILE" decrypt "$TMPDIR/inplace.q" "$TMPDIR/inplace.q"
+check_ok "ciphertext survives an input == output decrypt" \
+    cmp -s "$TMPDIR/inplace.q" "$TMPDIR/inplace.q.orig"
+# A FIFO (or <(cmd), /dev/stdin) reports st_size 0; it must be streamed, not
+# treated as an empty regular file.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    pass "FIFO input test skipped (no POSIX FIFOs for native binaries)"
+    ;;
+  *)
+    seq 1 50000 > "$TMPDIR/fifo_src.txt"
+    mkfifo "$TMPDIR/in.fifo"
+    cat "$TMPDIR/fifo_src.txt" > "$TMPDIR/in.fifo" &
+    FIFO_WRITER=$!
+    "$BINARY" --force --key-file "$KEYFILE" encrypt "$TMPDIR/in.fifo" "$TMPDIR/fifo.q" >/dev/null 2>&1
+    # If qsafe never opened the FIFO, the writer is still blocked: don't hang.
+    kill "$FIFO_WRITER" 2>/dev/null
+    wait "$FIFO_WRITER" 2>/dev/null
+    "$BINARY" --force --key-file "$KEYFILE" decrypt "$TMPDIR/fifo.q" "$TMPDIR/fifo.out" >/dev/null 2>&1
+    check_ok "FIFO input round-trips its full contents" \
+        cmp -s "$TMPDIR/fifo_src.txt" "$TMPDIR/fifo.out"
+    ;;
+esac
 
 # --- Test 16: no unverified plaintext released to a pipe ---
 echo ""
@@ -428,6 +492,21 @@ check_fail "--signer rejects the wrong signer" \
     "$TMPDIR/signed.q" "$TMPDIR/signed3.out"
 [ ! -f "$TMPDIR/signed3.out" ] \
     && pass "no plaintext left after signer rejection" || fail "no plaintext left after signer rejection"
+# --signer is a requirement, not a hint: anyone holding the recipient's public
+# key can produce an UNSIGNED file, which must not satisfy the pin.
+"$BINARY" --force --key-file "$KEYFILE" encrypt "$TMPDIR/test_input.txt" "$TMPDIR/unsigned.q" >/dev/null 2>&1
+check_fail "--signer rejects an unsigned file" \
+    "$BINARY" --force --key-file "$KEYFILE" decrypt --signer "$SIGKEY.pub" \
+    "$TMPDIR/unsigned.q" "$TMPDIR/unsigned.out"
+[ ! -f "$TMPDIR/unsigned.out" ] \
+    && pass "no plaintext written for an unsigned file under --signer" \
+    || fail "no plaintext written for an unsigned file under --signer"
+check_fail "verify --signer rejects an unsigned file" \
+    "$BINARY" --key-file "$KEYFILE" --signer "$SIGKEY.pub" verify "$TMPDIR/unsigned.q"
+# Legacy formats cannot carry a signature, so they can never satisfy --signer.
+check_fail "--signer rejects a legacy QSAFE006 file" \
+    env QSAFE_PASSPHRASE="v6-fixture-pass" "$BINARY" --force --key-file "$FIX/v6_key" \
+    --signer "$SIGKEY.pub" decrypt "$FIX/v6_msg.qsafe" "$TMPDIR/v6_signer.out"
 # A tampered payload byte must fail frame auth before any signature check.
 cp "$TMPDIR/signed.q" "$TMPDIR/signed.bad.q"
 orig=$(dd if="$TMPDIR/signed.bad.q" bs=1 skip=1800 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n')
@@ -579,6 +658,18 @@ check_ok "age round-trip matches" \
 check_fail "age-decrypt with wrong identity is rejected" \
     sh -c '"$1" age-keygen "$2" >/dev/null 2>&1; "$1" age-decrypt -i "$2" "$3" "$4"' \
     _ "$BINARY" "$TMPDIR/agekey2.txt" "$TMPDIR/age_ct.age" "$TMPDIR/age_bad.txt"
+# Bech32 checksum: a one-character typo in a recipient must be rejected, not
+# silently encrypted to a key nobody holds.
+c=${APUB:10:1}; [ "$c" = "q" ] && r="p" || r="q"
+ATYPO="${APUB:0:10}${r}${APUB:11}"
+check_fail "age-encrypt rejects a recipient with a bad checksum" \
+    "$BINARY" age-encrypt -r "$ATYPO" "$TMPDIR/age_pt.txt" "$TMPDIR/age_typo.age"
+# An overlong recipient must be rejected cleanly (exit 1), never overflow the
+# decoder's fixed-size key buffer.
+ALONG="age1$(printf 'q%.0s' $(seq 1 400))"
+"$BINARY" age-encrypt -r "$ALONG" "$TMPDIR/age_pt.txt" "$TMPDIR/age_long.age" >/dev/null 2>&1
+[ $? -eq 1 ] && pass "age-encrypt rejects an overlong recipient cleanly" \
+    || fail "age-encrypt rejects an overlong recipient cleanly"
 # Cross-validate against the real `age` binary when it is installed.
 if command -v age >/dev/null 2>&1; then
     age -d -i "$TMPDIR/agekey.txt" -o "$TMPDIR/age_real.txt" "$TMPDIR/age_ct.age" >/dev/null 2>&1
@@ -693,6 +784,27 @@ check_ok "vault read (inner slot) succeeds" \
     --passphrase-file "$TMPDIR/vault_inner.pass" "$TMPDIR/vault_inner.out"
 check_ok "inner round-trip matches" \
     cmp -s "$TMPDIR/vault_inner.in" "$TMPDIR/vault_inner.out"
+
+# Rewriting an occupied v1 slot reuses its AES-GCM nonces (two container
+# snapshots would reveal old XOR new plaintext), so it needs --force.
+echo "replacement outer payload" > "$TMPDIR/vault_outer2.in"
+check_fail "vault write refuses to overwrite an occupied slot without --force" \
+    "$BINARY" vault write "$VC" --offset 0 --capacity 20000 \
+    --passphrase-file "$TMPDIR/vault_outer.pass" "$TMPDIR/vault_outer2.in"
+"$BINARY" vault read "$VC" --offset 0 --capacity 20000 \
+    --passphrase-file "$TMPDIR/vault_outer.pass" "$TMPDIR/vault_outer.keep" >/dev/null 2>&1
+check_ok "refused overwrite leaves the slot intact" \
+    cmp -s "$TMPDIR/vault_outer.in" "$TMPDIR/vault_outer.keep"
+check_ok "vault write --force overwrites an occupied slot" \
+    "$BINARY" --force vault write "$VC" --offset 0 --capacity 20000 \
+    --passphrase-file "$TMPDIR/vault_outer.pass" "$TMPDIR/vault_outer2.in"
+"$BINARY" vault read "$VC" --offset 0 --capacity 20000 \
+    --passphrase-file "$TMPDIR/vault_outer.pass" "$TMPDIR/vault_outer2.out" >/dev/null 2>&1
+check_ok "forced overwrite round-trips" \
+    cmp -s "$TMPDIR/vault_outer2.in" "$TMPDIR/vault_outer2.out"
+# Restore the original outer payload for the tests below (forced again).
+"$BINARY" --force vault write "$VC" --offset 0 --capacity 20000 \
+    --passphrase-file "$TMPDIR/vault_outer.pass" "$TMPDIR/vault_outer.in" >/dev/null 2>&1
 
 echo ""
 echo "[test: vault deniability — indistinguishable failure modes]"
@@ -1019,6 +1131,40 @@ check_fail "wrong passphrase cannot open the secrets store" \
 env QSAFE_PASSPHRASE="$SECPASS" "$BINARY" secrets --store "$SEC" --scrypt-cost 14 rm db.pass >/dev/null 2>&1
 env QSAFE_PASSPHRASE="$SECPASS" "$BINARY" secrets --store "$SEC" --scrypt-cost 14 list 2>/dev/null | grep -q "db.pass" \
     && fail "secrets rm removes a key" || pass "secrets rm removes a key"
+
+# --- Test 24: secret-bearing files are owner-only from creation ---
+# Under a permissive umask, fopen() would create these 0644; they must be 0600
+# (and a user's own chmod on a container must survive a rewrite).
+echo ""
+echo "[test: secret file permissions]"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    pass "permission checks skipped (no POSIX mode bits on Windows)"
+    ;;
+  *)
+    fmode() { stat -c "%a" "$1" 2>/dev/null || stat -f "%Lp" "$1" 2>/dev/null; }
+    umask 022
+    PK="$TMPDIR/perm_keys"; mkdir -p "$PK"
+    "$BINARY" --force --scrypt-cost 14 --key-file "$PK/key.bin" keygen >/dev/null 2>&1
+    [ "$(fmode "$PK/key.bin")" = "600" ] && pass "secret key file is 0600" \
+        || fail "secret key file is 0600 (got $(fmode "$PK/key.bin"))"
+    "$BINARY" age-keygen "$PK/age.txt" >/dev/null 2>&1
+    [ "$(fmode "$PK/age.txt")" = "600" ] && pass "age identity file is 0600" \
+        || fail "age identity file is 0600 (got $(fmode "$PK/age.txt"))"
+    "$BINARY" --key-file "$PK/key.bin" split-key --threshold 2 --shares 2 "$PK/ks" >/dev/null 2>&1
+    [ "$(fmode "$PK/ks.share1")" = "600" ] && pass "key share file is 0600" \
+        || fail "key share file is 0600 (got $(fmode "$PK/ks.share1"))"
+    printf 'v' | env QSAFE_PASSPHRASE="$SECPASS" "$BINARY" secrets --store "$PK/store.bin" \
+        --scrypt-cost 14 set k >/dev/null 2>&1
+    [ "$(fmode "$PK/store.bin")" = "600" ] && pass "new secrets store is 0600" \
+        || fail "new secrets store is 0600 (got $(fmode "$PK/store.bin"))"
+    chmod 640 "$PK/store.bin"
+    printf 'v2' | env QSAFE_PASSPHRASE="$SECPASS" "$BINARY" secrets --store "$PK/store.bin" \
+        --scrypt-cost 14 set k2 >/dev/null 2>&1
+    [ "$(fmode "$PK/store.bin")" = "640" ] && pass "a rewrite keeps the container's existing mode" \
+        || fail "a rewrite keeps the container's existing mode (got $(fmode "$PK/store.bin"))"
+    ;;
+esac
 
 # --- Results ---
 echo ""

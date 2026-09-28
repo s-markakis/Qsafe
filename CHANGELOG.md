@@ -4,6 +4,67 @@ All notable changes to Qsafe are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Security-review fixes. No on-disk format changes.
+
+### Security
+- **`--signer` could be bypassed by an unsigned file.** `decrypt`/`verify
+  --signer <pk>` only compared the signer when an embedded signature was
+  present, so anyone holding the recipient's public key could send an unsigned
+  QSAFE007 file (or any QSAFE006/005 file) and it was accepted with exit 0.
+  `--signer` now requires a valid embedded signature and fails before any output
+  is opened.
+- **Stack buffer overflow in the age Bech32 decoder** (`age-encrypt -r`,
+  `age-decrypt -i`): an overlong `age1…`/`AGE-SECRET-KEY-1…` string overflowed a
+  64-byte stack buffer. The decoder is now bounded, and it also verifies the
+  Bech32 checksum, so a mistyped recipient is rejected instead of silently
+  encrypting to a key nobody holds.
+- **Vault v1 slot rewrites reused AES-GCM nonces.** v1 keys and frame nonces are
+  deterministic in `(passphrase, offset, capacity)`, so rewriting a slot with new
+  content under the same passphrase reused every `(key, nonce)` pair; an
+  adversary with old and new container snapshots learns `old ⊕ new` plaintext
+  and GCM's authentication key. `vault write` now refuses to overwrite a slot
+  that already opens under the passphrase unless `--force` is given, and
+  HIDDEN_VOLUMES.md documents the risk (the v2 commands are unaffected).
+- **Secret files are owner-only from creation.** Secret-key files, age and
+  age-plugin identities, and Shamir shares were created under the umask and
+  `chmod 0600`'d only after being written; they are now created `0600`. Vault
+  containers (including the `secrets` store, `~/.qsafe/secrets.bin`) were
+  rewritten with umask-default permissions (typically world-readable, exposing
+  them to offline passphrase guessing); new containers are now `0600` and a
+  rewrite keeps the existing file's mode. Stores created by earlier versions
+  keep their current mode — run `chmod 600 ~/.qsafe/secrets.bin` once.
+- **Stored filenames with backslashes.** The decrypt-side name sanitizer only
+  split on `/`, so on Windows a sender-chosen name like `..\..\x` decrypted into
+  a directory escaped it. Backslash is now a separator everywhere (and `:` on
+  Windows); `.` is discarded like `..`.
+- **Restored permissions honor the umask.** The sender-chosen mode was applied
+  verbatim (masked to `0777`), so a sender could make decrypted files
+  world-writable, or group/world-readable under a private umask; it is now
+  filtered through the process umask, like tar for non-root users.
+- **Keychain passphrase could be silently replaced** (macOS/Windows). A second
+  key-creating command with `--keychain` for the same key path (another
+  `keygen`, `join-key`, or `vault create` under the default key path) replaced
+  the random stored passphrase, even when the key file was then not
+  overwritten — permanently locking out the existing key. It now refuses unless
+  `--force` is given.
+
+### Fixed
+- Encrypting a FIFO, `<(cmd)` or `/dev/stdin` silently produced an **empty**
+  ciphertext (their `st_size` of 0 was trusted as the content length). Only
+  regular files are treated as fixed-length; other inputs are streamed.
+- `encrypt`/`decrypt` with the same file as input and output truncated the
+  input and then deleted it on the resulting failure; this is now refused.
+- `encrypt --armor` overwrote an existing output file without the overwrite
+  prompt.
+- Directory encryption followed symlinks: a `loop -> ..` link recursed until the
+  path limit (re-encrypting the parent tree, including its own output), and a
+  link to a file outside the tree was encrypted to the recipients. Symlinks are
+  now skipped with a warning.
+- A decrypted secret key of the wrong length (e.g. a signing key passed as the
+  decryption key) is now wiped before it is freed.
+
 ## [8.0.0] - 2026-08-20
 
 The write format moves to **QSAFE007** (decrypt still reads QSAFE006/005, so

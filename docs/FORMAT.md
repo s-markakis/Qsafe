@@ -287,7 +287,10 @@ recipient set — and the ASCII context string provides domain separation from
 detached signatures (§6). A reader MUST verify the signature whenever META flag
 bit 1 is set and MUST reject the file if verification fails. The reader SHOULD
 surface the signer (e.g. its SHA-256 fingerprint) and MAY additionally require
-`signer_pub` to equal a caller-pinned key (`--signer`).
+`signer_pub` to equal a caller-pinned key (`--signer`). When a signer is pinned,
+the reader MUST also reject files whose flag bit 1 is clear (and QSAFE006/005
+files, which cannot carry a signature): an unsigned file can be produced by
+anyone holding the recipient's public key.
 
 Note the trailer is itself covered by the payload AEAD, so an attacker without
 a recipient key can neither strip nor substitute it. A *recipient* can re-encrypt
